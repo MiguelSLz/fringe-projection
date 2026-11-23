@@ -71,6 +71,7 @@ target_link_libraries(fringe_projection PUBLIC ${OpenCV_LIBS})
 set(STEREO_LIB_SOURCES
     src/StereoCameraSystem.cpp
     src/GpioController.cpp
+    src/pwm_trigger.cpp
 )
 if(ENABLE_JETSON_GPIO)
     set(GPIO_LIB gpiod)

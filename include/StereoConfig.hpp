@@ -47,16 +47,32 @@ namespace stereo {
 
     struct ZNCCConfig {
         int numImages{10};
-        int motorSteps{20};
+        //int motorSteps{20};
         int warmupTriggers{2};
-        std::vector<int> motorPins{1, 0, 8, 2};
+        
+        
+        // --- Motor DC via PWM ---
+        std::string pwmChipA{"/sys/class/pwm/pwmchip3"};  // PIN 13 = pwm8 = PWMCHIP3 (32f0000)
+        std::string pwmChipB{"/sys/class/pwm/pwmchip2"};  // PIN 18 = pwm5 = pwmchip2 (32c0000)
+        int pwmChannel{0};     
+        double pwmFrequencyHz{1000};   
+        double pwmDutyPercent{0.0};     // duty cycle padrão
+
         int laserPin{106};
         int delayUs{3500};
-        int stepsPerRev{2048};
+
+    };
+
+    struct EncoderConfig {
+        std::vector<int> pins{11, 12};              // Header pin numbers or Linux GPIO numbers
+        std::string pinType{"HEADER_PIN"};          // "HEADER_PIN" or "LINUX_GPIO_NUM"
+        std::string jetsonModel{"JETSON_AGX_ORIN"}; // "JETSON_ORIN_NANO_NX" or "JETSON_AGX_ORIN"
+        int pulsesPerRev{2100};                     // resolução do encoder, ajustar para o valor correto
     };
 
     struct StereoSystemConfig {
         ZNCCConfig zncc;
+        EncoderConfig encoder; 
         CameraConfig leftCamera;
         CameraConfig rightCamera;
         GPIOTriggerConfig gpioTrigger;
@@ -140,20 +156,37 @@ namespace stereo {
             
             if (stereoNode["zncc"]) {
                 YAML::Node zNode = stereoNode["zncc"];
+
                 sysConfig.zncc.numImages = zNode["num_images"].as<int>(sysConfig.zncc.numImages);
-                sysConfig.zncc.motorSteps = zNode["motor_steps"].as<int>(sysConfig.zncc.motorSteps);
                 sysConfig.zncc.warmupTriggers = zNode["warmup_triggers"].as<int>(sysConfig.zncc.warmupTriggers);
+
                 sysConfig.zncc.laserPin = zNode["laser_pin"].as<int>(sysConfig.zncc.laserPin);
                 sysConfig.zncc.delayUs = zNode["delay_us"].as<int>(sysConfig.zncc.delayUs);
-                sysConfig.zncc.stepsPerRev = zNode["steps_per_rev"].as<int>(sysConfig.zncc.stepsPerRev);
-                if (zNode["motor_pins"] && zNode["motor_pins"].IsSequence()) {
-                    sysConfig.zncc.motorPins.clear();
-                    for (const auto& p : zNode["motor_pins"]) {
-                        sysConfig.zncc.motorPins.push_back(p.as<int>());
-                    }
-                }
+                
+                sysConfig.zncc.pwmChipA = zNode["pwm_chip_a"].as<std::string>(sysConfig.zncc.pwmChipA);
+                sysConfig.zncc.pwmChipB = zNode["pwm_chip_b"].as<std::string>(sysConfig.zncc.pwmChipB);
+                sysConfig.zncc.pwmChannel = zNode["pwm_channel"].as<int>(sysConfig.zncc.pwmChannel);
+                sysConfig.zncc.pwmFrequencyHz = zNode["pwm_frequency_hz"].as<double>(sysConfig.zncc.pwmFrequencyHz);
+                sysConfig.zncc.pwmDutyPercent = zNode["pwm_duty_percent"].as<double>(sysConfig.zncc.pwmDutyPercent);
             }
 
+            if (stereoNode["encoder"]) {
+                YAML::Node enc = stereoNode["encoder"];
+                
+                // Support both single pin and list of pins
+                if (enc["pins"] && enc["pins"].IsSequence()) {
+                    sysConfig.encoder.pins.clear();
+                    for (const auto& p : enc["pins"]) {
+                        sysConfig.encoder.pins.push_back(p.as<int>());
+                    }
+                } else if (enc["pin"]) {
+                    sysConfig.encoder.pins = { enc["pin"].as<int>() };
+                }
+
+                sysConfig.encoder.pinType = enc["pin_type"].as<std::string>(sysConfig.encoder.pinType);
+                sysConfig.encoder.jetsonModel = enc["jetson_model"].as<std::string>(sysConfig.encoder.jetsonModel);
+                sysConfig.encoder.pulsesPerRev = enc["pulses_per_rev"].as<int>(sysConfig.encoder.pulsesPerRev);
+            }
             return sysConfig;
         }
     };

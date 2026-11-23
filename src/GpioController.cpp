@@ -32,35 +32,40 @@ static int mapHeaderPinToGpio(int headerPin, const std::string& model) {
     if (model == "JETSON_ORIN_NANO_NX") {
         auto it = ORIN_NANO_PIN_MAP.find(headerPin);
         if (it != ORIN_NANO_PIN_MAP.end()) return it->second;
+    } else if (model == "JETSON_AGX_ORIN") {
+        auto it = ORIN_AGX_PIN_MAP.find(headerPin);
+        if (it != ORIN_AGX_PIN_MAP.end()) return it->second;
     }
     return headerPin;
 }
 
-GpioController::GpioController() {
-    m_step_sequence = {{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}, {0, 0, 0, 1}};
-}
 
 GpioController::~GpioController() {
     release();
 }
 
-bool GpioController::init(const GPIOTriggerConfig& trigCfg, const ZNCCConfig& znccCfg) {
+bool GpioController::init(const GPIOTriggerConfig& trigCfg, const ZNCCConfig& znccCfg, const EncoderConfig& encodCfg) {
     release();
+
+    // pegando os valores da configuração para os atributos do GpioController
     m_activeLow = trigCfg.activeLow;
-    m_delay_us = znccCfg.delayUs;
-    m_steps_per_rev = znccCfg.stepsPerRev;
-    std::cout << m_steps_per_rev << std::endl;
+    m_pwmChip_a = znccCfg.pwmChipA;
+    m_pwmChip_b = znccCfg.pwmChipB;
+    m_pwmChannelA = znccCfg.pwmChannel;
+    m_pwmChannelB = znccCfg.pwmChannel;
+    m_pwmFrequencyHz = znccCfg.pwmFrequencyHz;
+    m_pwmDutyPercent = znccCfg.pwmDutyPercent;
+
+    // setup motor
+    m_pwmA = std::make_unique<PwmTrigger>(m_pwmChip_a,m_pwmChannelA,m_pwmFrequencyHz, m_pwmDutyPercent);
+    m_pwmB = std::make_unique<PwmTrigger>(m_pwmChip_b,m_pwmChannelB,m_pwmFrequencyHz, m_pwmDutyPercent);
+    m_pwmA->start();
+    m_pwmB->start();
+
 #ifdef HAS_GPIOD
     m_chip0 = gpiod_chip_open_by_name("gpiochip0");
     if (!m_chip0) {
         std::cerr << "[GpioController] Error: Failed to open gpiochip0\n";
-        return false;
-    }
-    m_chip1 = gpiod_chip_open_by_name("gpiochip1");
-    if (!m_chip1) {
-        std::cerr << "[GpioController] Error: Failed to open gpiochip1\n";
-        gpiod_chip_close(m_chip0);
-        m_chip0 = nullptr;
         return false;
     }
 
@@ -89,15 +94,48 @@ bool GpioController::init(const GPIOTriggerConfig& trigCfg, const ZNCCConfig& zn
         }
     }
 
-    // 3. Setup Motor Pins (on chip1)
-    for (int pin : znccCfg.motorPins) {
-        struct gpiod_line* line = gpiod_chip_get_line(m_chip1, pin);
-        if (line) {
-            if (gpiod_line_request_output(line, "ZNCC_Motor", 0) == 0) {
-                m_motor_lines.push_back(line);
-                std::cout << "[GpioController] Motor line " << pin << " configured.\n";
-            }
+    // 3. Setup Encoder Pins
+    if (encodCfg.pins.size() >= 2) {
+        int pinA = encodCfg.pins[0];
+        int pinB = encodCfg.pins[1]; 
+        if (encodCfg.pinType == "HEADER_PIN") {
+            pinA = mapHeaderPinToGpio(pinA, encodCfg.jetsonModel);
+            pinB = mapHeaderPinToGpio(pinB, encodCfg.jetsonModel);
         }
+        struct gpiod_line* lineA = gpiod_chip_get_line(m_chip0, pinA);
+        struct gpiod_line* lineB = gpiod_chip_get_line(m_chip0, pinB);
+        if (!lineA || !lineB) {
+            std::cerr << "[GpioController] Error: Failed to get encoder lines from chip0 (A=" 
+                      << pinA << ", B=" << pinB << ")\n";
+            return false;
+        }
+        // Canal A: interrupções por hardware em AMBAS as bordas (subida e descida)
+        if (gpiod_line_request_both_edges_events(lineA, "Encoder_A") < 0) {
+            std::cerr << "[GpioController] Error: Failed to request edge events on Encoder line A (" 
+                      << pinA << ")\n";
+            return false;
+        }
+        // Canal B: entrada normal (apenas lê o nível no instante da borda de A)
+        if (gpiod_line_request_input(lineB, "Encoder_B") < 0) {
+            std::cerr << "[GpioController] Error: Failed to request input on Encoder line B (" 
+                      << pinB << ")\n";
+            gpiod_line_release(lineA);
+            return false;
+        }
+        m_encoder_lines.push_back(lineA); // m_encoder_lines[0] = Canal A
+        m_encoder_lines.push_back(lineB); // m_encoder_lines[1] = Canal B
+
+        std::cout << "[GpioController] Encoder lines configuradas: A=" 
+                  << pinA << " (interrupt), B=" << pinB << " (level)\n";
+
+        // 4. Start Encoder Thread
+        m_encoder_count = 0;
+        m_encoder_running = true;
+        m_encoder_thread = std::thread(&GpioController::encoderThreadLoop, this);
+        std::cout << "[GpioController] Thread do encoder iniciada.\n";
+
+    } else {
+        std::cerr << "[GpioController] Warning: EncoderConfig requires at least 2 pins (A and B).\n";
     }
 
     m_initialized = true;
@@ -107,22 +145,30 @@ bool GpioController::init(const GPIOTriggerConfig& trigCfg, const ZNCCConfig& zn
     m_initialized = true;
     return true;
 #endif
+
+
+
 }
 
 void GpioController::release() {
 #ifdef HAS_GPIOD
+
+    // 1. Para a thread do encoder primeiro
+    if (m_encoder_running.load()) {
+        m_encoder_running.store(false);
+        if (m_encoder_thread.joinable()) {
+            m_encoder_thread.join();
+        }
+    }
+    for (auto line : m_encoder_lines) {
+        if (line) gpiod_line_release(line);
+    }   
+    m_encoder_lines.clear();
+
     for (auto line : m_trigger_lines) {
         if (line) gpiod_line_release(line);
     }
     m_trigger_lines.clear();
-
-    for (auto line : m_motor_lines) {
-        if (line) {
-            gpiod_line_set_value(line, 0);
-            gpiod_line_release(line);
-        }
-    }
-    m_motor_lines.clear();
 
     if (m_laser_line) {
         gpiod_line_set_value(m_laser_line, 0);
@@ -134,11 +180,8 @@ void GpioController::release() {
         gpiod_chip_close(m_chip0);
         m_chip0 = nullptr;
     }
-    if (m_chip1) {
-        gpiod_chip_close(m_chip1);
-        m_chip1 = nullptr;
-    }
 #endif
+
     m_initialized = false;
 }
 
@@ -174,6 +217,11 @@ void GpioController::setLaser(bool on) {
 }
 
 void GpioController::moveMotor(float angle) {
+
+    if (!m_initialized) return;
+    
+
+    /*
     if (!m_initialized) return;
     int steps = static_cast<int>((angle / 360.0f) * m_steps_per_rev);
     if (steps == 0) {
@@ -201,7 +249,41 @@ void GpioController::moveMotor(float angle) {
         }
 #endif
         std::this_thread::sleep_for(std::chrono::microseconds(m_delay_us));
+    }*/
+}
+
+void GpioController::encoderThreadLoop() {
+    
+    if (m_encoder_lines.size() != 2) return;
+
+    struct gpiod_line* lineA = m_encoder_lines[0];
+    struct gpiod_line* lineB = m_encoder_lines[1];
+
+    const struct timespec timeout = {0, 100000000}; // 100ms timeout para checar m_encoder_running
+    struct gpiod_line_event event;
+
+    while (m_encoder_running.load()){
+        
+        int evento = gpiod_line_event_wait(lineA, &timeout); // =1 quando acontece um evento
+
+        if (evento==1){
+            if (gpiod_line_event_read(lineA, &event) == 0) { // leitura da borda bem sucedida
+                
+                int val_b = gpiod_line_get_value(lineB);
+                
+                // m_encoder_count aumenta com o sentido horario do motor
+                if (event.event_type == GPIOD_LINE_EVENT_RISING_EDGE){
+                    if (val_b == 0) m_encoder_count++;
+                    else m_encoder_count--;
+                } else if (event.event_type == GPIOD_LINE_EVENT_FALLING_EDGE){
+                    if (val_b == 1) m_encoder_count++;
+                    else m_encoder_count--;
+                }
+
+            }   
+        }
     }
+
 }
 
 } // namespace stereo

@@ -13,7 +13,6 @@ fringe_capture:
   projector_window_name: Projector
   save_raw_frames: true
   zncc:
-    motor_steps: 20
     num_images: 5
     warmup_triggers: 0
 stereo_system:
@@ -56,14 +55,19 @@ stereo_system:
       selector: FrameStart
       source: Line2
   zncc:
+    num_images: 5
+    warmup_triggers: 0
     delay_us: 3000
     laser_pin: 106
-    motor_pins:
-    - 1
-    - 0
-    - 8
-    - 2
-    motor_steps: 10
-    num_images: 5
-    steps_per_rev: 2048
-    warmup_triggers: 0
+    pwm_chip_a: "/sys/class/pwm/pwmchip3"
+    pwm_chip_b: "/sys/class/pwm/pwmchip2"
+    pwm_channel: 0
+    pwm_frequency_hz: 1000.0
+    pwm_duty_percent: 0.0
+  encoder:
+    pin_type: HEADER_PIN
+    jetson_model: JETSON_AGX_ORIN
+    pins:
+    - 11
+    - 12
+    pulses_per_rev: 2100
